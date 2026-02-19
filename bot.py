@@ -15,7 +15,16 @@ from block1_normalization import normalize_query, get_response_template
 from block2_rag import search_relevant_chunks, get_context_from_chunks, load_knowledge_base
 from block3_generation import generate_answer
 from block4_judge import judge_answer
-from block5_feedback import log_feedback, log_escalation, format_escalation_message, log_judge_only
+from block5_feedback import (
+    log_feedback,
+    log_escalation,
+    format_escalation_message,
+    log_judge_only,
+    get_feedback_log_path,
+    create_feedback_entry,
+    update_feedback_rating,
+    generate_request_id,
+)
 from gigachat_client import close_client
 
 # Настройка логирования
@@ -49,7 +58,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений - главная цепочка"""
     user_id = update.effective_user.id
     original_question = update.message.text
-    
+    logger.info("User %s исходный текст (до нормализации): %s", user_id, original_question)
+
     # Показываем, что бот думает
     thinking_msg = await update.message.reply_text("🤔 Думаю...")
     
@@ -58,24 +68,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         normalization_result = await normalize_query(original_question)
         query_type = normalization_result["type"]
         normalized_query = normalization_result["normalized_query"]
-        
+
         logger.info(f"User {user_id}: type={query_type}, normalized={normalized_query}")
+
+        try:
+            from logs_to_sheets import duplicate_normalization_to_sheets
+            from datetime import datetime
+            duplicate_normalization_to_sheets({
+                "timestamp": datetime.now().isoformat(),
+                "user_id": user_id,
+                "original_text": original_question,
+                "normalized_query": normalized_query,
+                "type": query_type,
+            })
+        except Exception:
+            pass
         
-        # Если не вопрос по курсу (abuse / off_topic / cheat) — шаблонный ответ, кнопки не показываем, Judge не вызываем.
-        # Верное определение типа вопроса считается успехом; шаблонный ответ не оценивается Judge.
+        # abuse / off_topic / cheat — шаблонный ответ, Блок 4 (Judge) проверяет корректность типа, Блок 5 не показываем.
         if query_type != "question":
             template_response = get_response_template(query_type)
+            judge_result = await judge_answer(
+                original_question,
+                context="",
+                answer=template_response,
+                query_type=query_type,
+            )
+            logger.info(f"Judge (шаблон) user {user_id}: question_type_correct={judge_result.get('question_type_correct')}")
+            log_judge_only(user_id, original_question, template_response, judge_result, request_id=None)
             await thinking_msg.edit_text(template_response)
-            log_feedback(user_id, original_question, template_response, "not_rated")
             return
-        
+
         # БЛОК 2: RAG - поиск релевантных чанков
         chunks = search_relevant_chunks(normalized_query)
         
         if not chunks:
             response = "Извините, в базе знаний не найдено информации по вашему вопросу. Попробуйте переформулировать вопрос или обратитесь к куратору."
+            judge_result = await judge_answer(original_question, "", response, query_type="question")
+            log_judge_only(user_id, original_question, response, judge_result, request_id=None)
             await thinking_msg.edit_text(response)
-            log_feedback(user_id, original_question, response, "not_rated")
             return
         
         context_text = get_context_from_chunks(chunks)
@@ -83,29 +113,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # БЛОК 3: Генерация ответа
         answer = await generate_answer(normalized_query, context_text)
         
-        # БЛОК 4: LLM-Judge (скрыто). Только для type=question; для abuse/off_topic/cheat Judge не вызывается — верное определение типа = успех.
+        # БЛОК 4: Judge для вопроса по курсу (полная оценка)
         judge_result = await judge_answer(original_question, context_text, answer, query_type=query_type)
         logger.info(f"Judge verdict for user {user_id}: {judge_result.get('overall_score', 'N/A')}")
-        
-        # Сохраняем контекст для обратной связи
+
+        request_id = generate_request_id()
         user_contexts[user_id] = {
+            "request_id": request_id,
             "question": original_question,
             "answer": answer,
-            "judge_verdict": judge_result
+            "judge_verdict": judge_result,
         }
-        
-        # Логируем оценку Judge сразу (даже если пользователь не нажмет кнопку)
-        log_judge_only(user_id, original_question, answer, judge_result)
-        
-        # БЛОК 5: Отправляем ответ с кнопками обратной связи
+        log_judge_only(user_id, original_question, answer, judge_result, request_id=request_id)
+        create_feedback_entry(request_id, user_id, original_question, answer, "question", judge_result)
+
+        # БЛОК 5: кнопки только для type=question
         keyboard = [
             [
-                InlineKeyboardButton("✅ Полезно", callback_data=f"feedback_helpful_{user_id}"),
-                InlineKeyboardButton("❌ Не помогло", callback_data=f"feedback_not_helpful_{user_id}")
+                InlineKeyboardButton("✅ Полезно", callback_data=f"feedback_helpful_{request_id}"),
+                InlineKeyboardButton("❌ Не помогло", callback_data=f"feedback_not_helpful_{request_id}"),
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await thinking_msg.edit_text(answer, reply_markup=reply_markup)
         
     except Exception as e:
@@ -118,37 +147,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик обратной связи (кнопки)"""
     query = update.callback_query
-    await query.answer()
-    
+    data = query.data or ""
     user_id = update.effective_user.id
-    data = query.data
-    
+    logger.info("Callback feedback: data=%s user_id=%s", data, user_id)
+
+    await query.answer()
+
+    context_data = user_contexts.get(user_id, {})
+    if not context_data:
+        logger.warning("Нет контекста для user_id=%s (бот перезапускали или другой инстанс). Фидбэк всё равно запишем.", user_id)
+
     if data.startswith("feedback_helpful_"):
-        # Полезно
-        context_data = user_contexts.get(user_id, {})
-        log_feedback(
-            user_id,
-            context_data.get("question", "unknown"),
-            context_data.get("answer", "unknown"),
-            "helpful",
-            context_data.get("judge_verdict")
-        )
-        
+        request_id = data[len("feedback_helpful_"):]
+        updated = update_feedback_rating(request_id, "helpful")
+        if not updated:
+            log_feedback(
+                user_id,
+                context_data.get("question", "unknown"),
+                context_data.get("answer", "unknown"),
+                "helpful",
+                context_data.get("judge_verdict"),
+            )
+        logger.info("Feedback: user %s нажал «Полезно» request_id=%s", user_id, request_id)
+
         await query.edit_message_text(
             query.message.text + "\n\n✅ Рад, что помогло!"
         )
-        
+
     elif data.startswith("feedback_not_helpful_"):
-        # Не помогло — лог + модалка «Вызвать куратора» / «Закрыть». Эскалация в препода — только по кнопке «Вызвать куратора».
-        context_data = user_contexts.get(user_id, {})
-        log_feedback(
-            user_id,
-            context_data.get("question", "unknown"),
-            context_data.get("answer", "unknown"),
-            "not_helpful",
-            context_data.get("judge_verdict")
-        )
-        
+        request_id = data[len("feedback_not_helpful_"):]
+        updated = update_feedback_rating(request_id, "not_helpful")
+        if not updated:
+            log_feedback(
+                user_id,
+                context_data.get("question", "unknown"),
+                context_data.get("answer", "unknown"),
+                "not_helpful",
+                context_data.get("judge_verdict"),
+            )
+        logger.info("Feedback: user %s нажал «Не помогло» request_id=%s", user_id, request_id)
+
         keyboard = [
             [
                 InlineKeyboardButton("🔔 Вызвать куратора", callback_data=f"escalate_{user_id}"),
@@ -235,7 +273,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_escalation, pattern="^(escalate_|close_)"))
     
     # Запускаем бота
-    logger.info("Бот запущен...")
+    logger.info("Бот запущен. Лог фидбэка: %s", get_feedback_log_path())
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except KeyboardInterrupt:

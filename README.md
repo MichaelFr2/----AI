@@ -6,10 +6,11 @@
 
 1. **Окружение:** `./scripts/setup_env.sh` (или вручную: `python3 -m venv venv && source venv/bin/activate`)
 2. **Зависимости:** `pip install -r requirements.txt`
-3. **Конфиг:** скопируйте `env_example.txt` в `.env`, заполните:
+3. **Конфиг:** создайте `.env`, заполните:
    - `TELEGRAM_BOT_TOKEN` — токен от [@BotFather](https://t.me/BotFather)
    - `GIGACHAT_AUTH_KEY` — ключ GigaChat (Сбер)
    - `CURATOR_CHAT_ID` — (опционально) chat_id куратора
+   - (опционально) `GOOGLE_SHEET_ID` и `GOOGLE_CREDENTIALS_PATH` — дублирование логов в Google Таблицу в реальном времени, см. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 4. **База знаний:** положите PDF/TXT/MD/DOCX в `knowledge_base/`
 5. **Запуск:** `python bot.py` или `./scripts/run.sh`
 

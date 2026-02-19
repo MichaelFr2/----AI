@@ -1,5 +1,7 @@
-"""Блок 2: RAG - поиск по базе знаний"""
+"""Блок 2: RAG - поиск по базе знаний.
+Поддержка гибридного поиска: векторная близость + совпадение ключевых слов (точные термины из запроса)."""
 import os
+import re
 from typing import List, Dict, Any
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -17,11 +19,12 @@ embeddings = HuggingFaceEmbeddings(
     model_kwargs={'device': 'cpu'}
 )
 
-# Инициализация сплиттера
+# Сплиттер: сначала по абзацам/предложениям, потом по словам, чтобы не резать термины
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=config.CHUNK_SIZE,
     chunk_overlap=config.CHUNK_OVERLAP,
     length_function=len,
+    separators=["\n\n", "\n", ". ", ", ", " ", ""],
 )
 
 vector_store = None
@@ -46,22 +49,28 @@ def load_knowledge_base():
             if filename.endswith('.pdf'):
                 loader = PyPDFLoader(filepath)
                 docs = loader.load()
-                documents.extend(docs)
+                for d in docs:
+                    if d.page_content and d.page_content.strip():
+                        d.page_content = d.page_content.replace("\x00", "").strip()
+                        if d.page_content:
+                            documents.append(d)
             elif filename.endswith('.txt'):
                 loader = TextLoader(filepath, encoding='utf-8')
                 docs = loader.load()
-                documents.extend(docs)
+                for d in docs:
+                    if d.page_content and d.page_content.strip():
+                        documents.append(d)
             elif filename.endswith('.md'):
-                # Для MD файлов читаем как текст
                 with open(filepath, 'r', encoding='utf-8') as f:
-                    text = f.read()
-                documents.append(Document(page_content=text, metadata={"source": filename}))
+                    text = f.read().strip()
+                if text:
+                    documents.append(Document(page_content=text, metadata={"source": filename}))
             elif filename.endswith('.docx'):
-                # Для DOCX используем python-docx
                 from docx import Document as DocxDocument
                 doc = DocxDocument(filepath)
-                text = '\n'.join([p.text for p in doc.paragraphs])
-                documents.append(Document(page_content=text, metadata={"source": filename}))
+                text = '\n'.join([p.text for p in doc.paragraphs if p.text]).strip()
+                if text:
+                    documents.append(Document(page_content=text, metadata={"source": filename}))
         except Exception as e:
             print(f"Ошибка при загрузке {filename}: {e}")
             continue
@@ -88,45 +97,85 @@ def load_knowledge_base():
     return vector_store
 
 
+def _extract_query_terms(query: str) -> List[str]:
+    """Извлекает значимые слова из запроса для поиска точных вхождений (кириллица + латиница + цифры)."""
+    # Оставляем буквы (в т.ч. кириллица), цифры, дефис; разбиваем по пробелам и знакам
+    raw = re.sub(r"[^\w\s\-]", " ", query, flags=re.UNICODE)
+    words = [w.strip().lower() for w in raw.split() if w.strip()]
+    # Отбрасываем слишком короткие (союзы, предлоги) и длиной не больше 50
+    return [w for w in words if 2 <= len(w) <= 50]
+
+
+def _keyword_score(chunk_text: str, terms: List[str]) -> int:
+    """Считает, сколько терминов запроса встречаются в чанке (без учёта регистра)."""
+    if not terms:
+        return 0
+    lower = chunk_text.lower()
+    return sum(1 for t in terms if t in lower)
+
+
 def search_relevant_chunks(query: str, top_k: int = None) -> List[Dict[str, Any]]:
     """
-    Ищет релевантные чанки по запросу.
+    Гибридный поиск: семантика (эмбеддинги) + совпадение ключевых слов.
+    Так находятся и точные термины из базы (ESG, названия и т.д.), и смыслово близкие фрагменты.
     
     Returns:
         List of dicts with keys: content, score, metadata
     """
     global vector_store
-    
+
     if vector_store is None:
-        # Попытка загрузить существующую БД
         if os.path.exists(config.VECTOR_DB_PATH):
             try:
                 vector_store = Chroma(
                     persist_directory=config.VECTOR_DB_PATH,
-                    embedding_function=embeddings
+                    embedding_function=embeddings,
                 )
-            except:
+            except Exception:
                 vector_store = load_knowledge_base()
         else:
             vector_store = load_knowledge_base()
-    
+
     if vector_store is None:
         return []
-    
+
     top_k = top_k or config.TOP_K
-    
-    # Поиск с возвратом метаданных и скоров
-    results = vector_store.similarity_search_with_score(query, k=top_k)
-    
-    chunks = []
+    n_candidates = getattr(config, "TOP_K_CANDIDATES", 16)
+
+    # 1) Берём больше кандидатов по векторной близости
+    results = vector_store.similarity_search_with_score(query, k=min(n_candidates, 50))
+
+    terms = _extract_query_terms(query)
+    chunks_with_meta = []
+
     for doc, score in results:
-        chunks.append({
-            "content": doc.page_content,
-            "score": float(score),
-            "metadata": doc.metadata
+        content = doc.page_content
+        # Chroma: меньше score = ближе (L2). Нормализуем в "похожесть": чем меньше distance, тем лучше
+        vector_score = float(score)
+        kw = _keyword_score(content, terms)
+        chunks_with_meta.append({
+            "content": content,
+            "score": vector_score,
+            "metadata": doc.metadata,
+            "keyword_hits": kw,
+            "terms": terms,
         })
-    
-    return chunks
+
+    # 2) Переранжирование: чанки с большим числом совпадений терминов — выше
+    def rank_key(c):
+        return (c["keyword_hits"], -c["score"])
+
+    chunks_with_meta.sort(key=rank_key, reverse=True)
+
+    # 3) Возвращаем top_k, убираем служебные поля для совместимости
+    out = []
+    for c in chunks_with_meta[:top_k]:
+        out.append({
+            "content": c["content"],
+            "score": c["score"],
+            "metadata": c["metadata"],
+        })
+    return out
 
 
 def get_context_from_chunks(chunks: List[Dict[str, Any]]) -> str:

@@ -19,10 +19,12 @@ KNOWLEDGE_BASE_PATH = os.getenv("KNOWLEDGE_BASE_PATH", "./knowledge_base")
 LOGS_PATH = os.getenv("LOGS_PATH", "./logs")
 VECTOR_DB_PATH = "./vector_db"
 
-# RAG Settings
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 100
+# RAG Settings (при изменении удалите папку vector_db/ и перезапустите бота)
+CHUNK_SIZE = 800   # символов: больше контекста, реже обрезка терминов
+CHUNK_OVERLAP = 150
 TOP_K = 4
+# Гибридный поиск: берём больше кандидатов по вектору, переранжируем по совпадению слов запроса
+TOP_K_CANDIDATES = 16
 
 # LLM Settings
 TEMPERATURE_GENERATION = 0.3
@@ -31,3 +33,12 @@ MAX_TOKENS = 700
 # Embeddings
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+# Дублирование логов в Google Таблицу (реальное время). Если не задано — только файлы.
+_raw_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip() or "1UhkErAjyPc2MlT1KqnWa_WWuIwi95rcNWO2fYrJd0D8"
+if "/spreadsheets/d/" in _raw_sheet_id or "docs.google.com" in _raw_sheet_id:
+    import re
+    _m = re.search(r"/d/([a-zA-Z0-9_-]+)", _raw_sheet_id)
+    GOOGLE_SHEET_ID = _m.group(1) if _m else _raw_sheet_id
+else:
+    GOOGLE_SHEET_ID = _raw_sheet_id
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "google_credentials.json")
