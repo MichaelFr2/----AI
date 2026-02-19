@@ -44,11 +44,14 @@ def _get_client():
         return None, None
 
 
-def _ensure_headers(ws, headers: list) -> None:
-    """Если первая строка пустая или без заголовка — записать заголовки."""
+def _ensure_headers(ws, headers: list, force_if_mismatch: bool = False) -> None:
+    """Записывает заголовки в первую строку. Если force_if_mismatch — перезаписать при несовпадении числа колонок или первой колонки."""
     try:
         row1 = ws.row_values(1)
-        if not row1 or (row1 and row1[0] != "timestamp"):
+        need_update = not row1 or row1[0] != "timestamp"
+        if force_if_mismatch and row1:
+            need_update = need_update or len(row1) != len(headers) or (len(row1) > 5 and row1[5] != headers[5])
+        if need_update:
             end_col = chr(ord("A") + min(len(headers), 26) - 1)
             ws.update(f"A1:{end_col}1", [headers], value_input_option="USER_ENTERED")
     except Exception:
@@ -75,13 +78,21 @@ def _append_normalization_sync(entry: Dict[str, Any]) -> None:
         logger.warning("Sheets append Normalization: %s", e)
 
 
+# Фиксированный порядок колонок Judge: заголовки и данные в одном порядке
+JUDGE_HEADERS = [
+    "timestamp", "request_id", "user_id", "question", "answer",
+    "rel", "grnd", "safe", "compl",
+    "verdict", "score", "type_ok", "refusal_ok", "explanation",
+]
+
+
 def _append_judge_sync(entry: Dict[str, Any]) -> None:
     gc, sh = _get_client()
     if not sh:
         return
     try:
-        ws = sh.worksheet("Judge") if "Judge" in [s.title for s in sh.worksheets()] else sh.add_worksheet("Judge", rows=1000, cols=12)
-        _ensure_headers(ws, ["timestamp", "request_id", "user_id", "question", "answer", "verdict", "overall_score", "question_type_correct", "correct_refusal", "explanation"])
+        ws = sh.worksheet("Judge") if "Judge" in [s.title for s in sh.worksheets()] else sh.add_worksheet("Judge", rows=1000, cols=16)
+        _ensure_headers(ws, JUDGE_HEADERS, force_if_mismatch=True)
         j = entry.get("judge_verdict") or {}
         row = [
             entry.get("timestamp", ""),
@@ -89,6 +100,10 @@ def _append_judge_sync(entry: Dict[str, Any]) -> None:
             entry.get("user_id", ""),
             (entry.get("question") or "")[:500],
             (entry.get("answer") or "")[:500],
+            j.get("relevance", ""),
+            j.get("groundedness", ""),
+            j.get("safety", ""),
+            j.get("completeness", ""),
             j.get("verdict", ""),
             j.get("overall_score", ""),
             j.get("question_type_correct", ""),
