@@ -86,6 +86,11 @@ def create_feedback_entry(
             duplicate_feedback_to_sheets(log_entry)
         except Exception:
             pass
+        try:
+            from logs_to_excel import duplicate_feedback_to_excel
+            duplicate_feedback_to_excel(log_entry)
+        except Exception:
+            pass
     except Exception as e:
         logger.exception("Ошибка записи feedback entry: %s", e)
 
@@ -103,6 +108,11 @@ def update_feedback_rating(request_id: str, rating: str) -> bool:
                 try:
                     from logs_to_sheets import duplicate_feedback_rating_update_to_sheets
                     duplicate_feedback_rating_update_to_sheets(request_id, rating, feedback_at)
+                except Exception:
+                    pass
+                try:
+                    from logs_to_excel import duplicate_feedback_rating_update_to_excel
+                    duplicate_feedback_rating_update_to_excel(request_id, rating, feedback_at)
                 except Exception:
                     pass
                 return True
@@ -134,6 +144,11 @@ def log_feedback(user_id: int, question: str, answer: str, rating: str, judge_ve
         try:
             from logs_to_sheets import duplicate_feedback_to_sheets
             duplicate_feedback_to_sheets(log_entry)
+        except Exception:
+            pass
+        try:
+            from logs_to_excel import duplicate_feedback_to_excel
+            duplicate_feedback_to_excel(log_entry)
         except Exception:
             pass
     except Exception as e:
@@ -192,6 +207,11 @@ def log_judge_only(
             duplicate_judge_to_sheets(log_entry)
         except Exception:
             pass
+        try:
+            from logs_to_excel import duplicate_judge_to_excel
+            duplicate_judge_to_excel(log_entry)
+        except Exception:
+            pass
     except IOError as e:
         logger.exception("Ошибка записи в judge_log.json: %s", e)
 
@@ -228,17 +248,31 @@ def log_escalation(user_id: int, question: str, answer: str, judge_verdict: Opti
             duplicate_escalation_to_sheets(log_entry)
         except Exception:
             pass
+        try:
+            from logs_to_excel import duplicate_escalation_to_excel
+            duplicate_escalation_to_excel(log_entry)
+        except Exception:
+            pass
     except IOError as e:
         logger.exception("Ошибка записи в escalation_log.json: %s", e)
 
     return log_entry
 
 
-def format_escalation_message(user_id: int, question: str, answer: str, judge_verdict: Optional[Dict] = None) -> str:
-    """Форматирует сообщение для куратора"""
+def format_escalation_message(
+    user_id: int,
+    question: str,
+    answer: str,
+    judge_verdict: Optional[Dict] = None,
+    username: Optional[str] = None,
+) -> str:
+    """Форматирует сообщение для куратора (username — @ студента для удобства)."""
+    username_str = f"@{username}" if username else "не указан"
+    reply_cmd = f"/reply {user_id} "
     message = f"""🔔 Эскалация от студента
 
 👤 Студент ID: {user_id}
+📛 Username: {username_str}
 
 ❓ Вопрос:
 {question}
@@ -255,6 +289,6 @@ def format_escalation_message(user_id: int, question: str, answer: str, judge_ve
         if judge_verdict.get("explanation"):
             message += f"\nКомментарий: {judge_verdict['explanation']}"
     
-    message += "\n\nПожалуйста, свяжитесь со студентом."
+    message += f"\n\n✏️ Ответить: скопируйте команду ниже и допишите текст после пробела:\n`{reply_cmd}`"
     
     return message

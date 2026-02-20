@@ -45,7 +45,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если это куратор - сохраняем его chat_id
     if config.CURATOR_CHAT_ID and str(user_id) == str(config.CURATOR_CHAT_ID):
         await update.message.reply_text(
-            "Вы зарегистрированы как куратор. Вы будете получать уведомления об эскалациях."
+            "Вы зарегистрированы как куратор. Вы будете получать уведомления об эскалациях.\n\n"
+            "Чтобы ответить студенту через бота, используйте:\n"
+            "/reply <user_id> <текст ответа>\n"
+            "Пример: /reply 987654321 Посмотрите главу 3, раздел 2 — там ответ на ваш вопрос."
         )
     else:
         await update.message.reply_text(
@@ -54,10 +57,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает Telegram user ID — нужен для привязки куратора в .env (CURATOR_CHAT_ID)."""
+    user_id = update.effective_user.id
+    text = f"Ваш Telegram ID: `{user_id}`\n\n"
+    if config.CURATOR_CHAT_ID and str(user_id) == str(config.CURATOR_CHAT_ID):
+        text += "Вы уже привязаны как куратор."
+    else:
+        text += "Чтобы сделать этого пользователя куратором, в .env добавьте или измените:\n`CURATOR_CHAT_ID=" + str(user_id) + "`"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений - главная цепочка"""
     user_id = update.effective_user.id
     original_question = update.message.text
+
+    # Сообщения, содержащие /reply, не обрабатываем как вопрос (чтобы куратор мог писать «/reply id текст» без запуска RAG)
+    if "/reply" in (original_question or ""):
+        await update.message.reply_text(
+            "Чтобы ответить студенту, используйте команду: нажмите /reply и введите user_id и текст."
+        )
+        return
+
     logger.info("User %s исходный текст (до нормализации): %s", user_id, original_question)
 
     # Показываем, что бот думает
@@ -74,13 +96,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             from logs_to_sheets import duplicate_normalization_to_sheets
             from datetime import datetime
-            duplicate_normalization_to_sheets({
+            entry = {
                 "timestamp": datetime.now().isoformat(),
                 "user_id": user_id,
                 "original_text": original_question,
                 "normalized_query": normalized_query,
                 "type": query_type,
-            })
+            }
+            duplicate_normalization_to_sheets(entry)
+            try:
+                from logs_to_excel import duplicate_normalization_to_excel
+                duplicate_normalization_to_excel(entry)
+            except Exception:
+                pass
         except Exception:
             pass
         
@@ -118,11 +146,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Judge verdict for user {user_id}: {judge_result.get('overall_score', 'N/A')}")
 
         request_id = generate_request_id()
+        logger.info("User %s: request_id=%s (для фидбэка/поиска в feedback_log)", user_id, request_id)
         user_contexts[user_id] = {
             "request_id": request_id,
             "question": original_question,
             "answer": answer,
             "judge_verdict": judge_result,
+            "username": getattr(update.effective_user, "username", None),
         }
         log_judge_only(user_id, original_question, answer, judge_result, request_id=request_id)
         create_feedback_entry(request_id, user_id, original_question, answer, "question", judge_result)
@@ -227,7 +257,8 @@ async def handle_escalation(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     user_id,
                     context_data.get("question", "unknown"),
                     context_data.get("answer", "unknown"),
-                    context_data.get("judge_verdict")
+                    context_data.get("judge_verdict"),
+                    context_data.get("username"),
                 )
                 
                 await context.bot.send_message(
@@ -253,6 +284,45 @@ async def handle_escalation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(query.message.text)
 
 
+async def reply_to_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для куратора: отправить ответ студенту через бота. Только от CURATOR_CHAT_ID."""
+    user_id = update.effective_user.id
+    if not config.CURATOR_CHAT_ID or str(user_id) != str(config.CURATOR_CHAT_ID):
+        await update.message.reply_text("Команда доступна только куратору.")
+        return
+
+    # /reply <student_user_id> <текст ответа>
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Использование: /reply <user_id> <текст ответа>\n"
+            "Пример: /reply 987654321 Ваш ответ студенту здесь."
+        )
+        return
+
+    try:
+        student_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом (Telegram ID студента).")
+        return
+
+    reply_text = " ".join(args[1:]).strip()
+    if not reply_text:
+        await update.message.reply_text("Укажите текст ответа после user_id.")
+        return
+
+    try:
+        await context.bot.send_message(chat_id=student_id, text=f"📩 Ответ от куратора:\n\n{reply_text}")
+        logger.info("Куратор отправил ответ студенту %s", student_id)
+        await update.message.reply_text(f"✅ Ответ отправлен студенту (id={student_id}).")
+    except Exception as e:
+        logger.exception("Ошибка отправки ответа студенту %s: %s", student_id, e)
+        await update.message.reply_text(
+            f"⚠️ Не удалось отправить сообщение студенту (id={student_id}). "
+            "Убедитесь, что студент хотя бы раз писал боту (/start)."
+        )
+
+
 def main():
     """Запуск бота"""
     if not config.TELEGRAM_BOT_TOKEN:
@@ -268,6 +338,8 @@ def main():
     
     # Регистрируем обработчики
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("my_id", my_id))
+    application.add_handler(CommandHandler("reply", reply_to_student))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_feedback, pattern="^feedback_"))
     application.add_handler(CallbackQueryHandler(handle_escalation, pattern="^(escalate_|close_)"))

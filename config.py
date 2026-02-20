@@ -20,11 +20,11 @@ LOGS_PATH = os.getenv("LOGS_PATH", "./logs")
 VECTOR_DB_PATH = "./vector_db"
 
 # RAG Settings (при изменении удалите папку vector_db/ и перезапустите бота)
-CHUNK_SIZE = 800   # символов: больше контекста, реже обрезка терминов
-CHUNK_OVERLAP = 150
-TOP_K = 4
-# Гибридный поиск: берём больше кандидатов по вектору, переранжируем по совпадению слов запроса
-TOP_K_CANDIDATES = 16
+# Можно переопределить в .env: CHUNK_SIZE, CHUNK_OVERLAP, RAG_TOP_K, RAG_TOP_K_CANDIDATES
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))   # размер чанка в символах; больше — больше контекста, реже режем термины
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))  # перекрытие чанков, чтобы не резать фразу по границе
+TOP_K = int(os.getenv("RAG_TOP_K", "6"))   # сколько чанков отдаём в промпт; больше — больше контекста, дороже по токенам
+TOP_K_CANDIDATES = int(os.getenv("RAG_TOP_K_CANDIDATES", "24"))  # кандидатов по вектору до переранжирования; больше — выше шанс найти нужный фрагмент
 
 # LLM Settings
 TEMPERATURE_GENERATION = 0.3

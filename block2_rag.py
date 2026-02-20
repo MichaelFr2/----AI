@@ -30,6 +30,17 @@ text_splitter = RecursiveCharacterTextSplitter(
 vector_store = None
 
 
+def _normalize_text_for_indexing(text: str) -> str:
+    """Нормализация текста перед разбиением: убираем лишние пробелы/переносы, чтобы не портить чанки."""
+    if not text or not text.strip():
+        return text
+    # Убираем нулевые байты и лишние пробелы/переносы
+    t = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    return t.strip()
+
+
 def load_knowledge_base():
     """Загружает материалы курса в векторную базу"""
     global vector_store
@@ -40,40 +51,46 @@ def load_knowledge_base():
         return None
     
     documents = []
-    
-    # Загрузка файлов
-    for filename in os.listdir(config.KNOWLEDGE_BASE_PATH):
-        filepath = os.path.join(config.KNOWLEDGE_BASE_PATH, filename)
-        
-        try:
-            if filename.endswith('.pdf'):
-                loader = PyPDFLoader(filepath)
-                docs = loader.load()
-                for d in docs:
-                    if d.page_content and d.page_content.strip():
-                        d.page_content = d.page_content.replace("\x00", "").strip()
-                        if d.page_content:
-                            documents.append(d)
-            elif filename.endswith('.txt'):
-                loader = TextLoader(filepath, encoding='utf-8')
-                docs = loader.load()
-                for d in docs:
-                    if d.page_content and d.page_content.strip():
-                        documents.append(d)
-            elif filename.endswith('.md'):
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    text = f.read().strip()
-                if text:
-                    documents.append(Document(page_content=text, metadata={"source": filename}))
-            elif filename.endswith('.docx'):
-                from docx import Document as DocxDocument
-                doc = DocxDocument(filepath)
-                text = '\n'.join([p.text for p in doc.paragraphs if p.text]).strip()
-                if text:
-                    documents.append(Document(page_content=text, metadata={"source": filename}))
-        except Exception as e:
-            print(f"Ошибка при загрузке {filename}: {e}")
-            continue
+    base_path = os.path.abspath(config.KNOWLEDGE_BASE_PATH)
+
+    # Обход всех файлов в knowledge_base и во вложенных папках (PDF, TXT, MD, DOCX)
+    for root, _dirs, files in os.walk(base_path):
+        for filename in files:
+            filepath = os.path.join(root, filename)
+            rel_path = os.path.relpath(filepath, base_path)
+            try:
+                if filename.lower().endswith('.pdf'):
+                    loader = PyPDFLoader(filepath)
+                    docs = loader.load()
+                    for d in docs:
+                        if d.page_content and d.page_content.strip():
+                            d.page_content = _normalize_text_for_indexing(d.page_content)
+                            if d.page_content:
+                                d.metadata["source"] = rel_path
+                                documents.append(d)
+                elif filename.lower().endswith('.txt'):
+                    loader = TextLoader(filepath, encoding='utf-8')
+                    docs = loader.load()
+                    for d in docs:
+                        if d.page_content and d.page_content.strip():
+                            d.page_content = _normalize_text_for_indexing(d.page_content)
+                            if d.page_content:
+                                d.metadata["source"] = rel_path
+                                documents.append(d)
+                elif filename.lower().endswith('.md'):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        text = _normalize_text_for_indexing(f.read())
+                    if text:
+                        documents.append(Document(page_content=text, metadata={"source": rel_path}))
+                elif filename.lower().endswith('.docx'):
+                    from docx import Document as DocxDocument
+                    doc = DocxDocument(filepath)
+                    text = _normalize_text_for_indexing('\n'.join([p.text for p in doc.paragraphs if p.text]))
+                    if text:
+                        documents.append(Document(page_content=text, metadata={"source": rel_path}))
+            except Exception as e:
+                print(f"Ошибка при загрузке {rel_path}: {e}")
+                continue
     
     if not documents:
         print(f"Не найдено документов в {config.KNOWLEDGE_BASE_PATH}")
