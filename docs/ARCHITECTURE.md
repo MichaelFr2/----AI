@@ -3,16 +3,17 @@
 ## Поток обработки запроса
 
 1. **Вход:** сообщение пользователя в Telegram.
+   - Сообщения **без текста** (фото, стикер, голос, видео и т.д.): ответ «Пожалуйста, напишите текстом» — без вызова блоков 1–4.
 2. **Лог:** в консоль пишется исходный текст (до нормализации).
-3. **Блок 1 — Нормализация:** классификация типа (question | abuse | off_topic | cheat) и нормализованный запрос. Результат дублируется в лист **Normalization** (Google Таблица), если настроено.
+3. **Блок 1 — Нормализация:** классификация типа (question | abuse | off_topic | cheat) и нормализованный запрос. При явных оскорблениях в тексте (по списку маркеров) тип принудительно **abuse**. Результат дублируется в лист **Normalization** (Google Таблица), если настроено.
 4. **Ветвление по типу:**
-   - **abuse / off_topic / cheat:** шаблонный ответ → **Блок 4 Judge** (контекст пустой, проверка корректности типа) → запись в judge_log + лист Judge → ответ пользователю **без кнопок**, выход.
+   - **abuse / off_topic / cheat:** шаблонный ответ → **Блок 4 Judge** (контекст пустой, проверка корректности типа). При верном типе (question_type_correct=1) и корректном шаблонном ответе Judge выставляет высшие оценки (5) и verdict=good — модель отработала правильно. Запись в judge_log + лист Judge → ответ пользователю **без кнопок**, выход.
    - **question:** переход к RAG.
 5. **Блок 2 — RAG:** поиск чанков по нормализованному запросу.
    - **Нет чанков:** отказ «в базе не найдено» → Judge → judge_log + Judge в таблице → ответ **без кнопок**, выход.
    - **Есть чанки:** контекст собирается, переход к генерации.
 6. **Блок 3 — Генерация:** ответ по контексту (GigaChat).
-7. **Блок 4 — Judge:** полная оценка (relevance, groundedness, safety, completeness, question_type_correct, correct_refusal, verdict). Если type_ok=0 или refusal_ok=0, показатели rel/grnd/safe/compl в ответе Judge обнуляются.
+7. **Блок 4 — Judge:** полная оценка (relevance, groundedness, safety, completeness, question_type_correct, correct_refusal, verdict). Если question_type_correct=0 или correct_refusal=0, показатели rel/grnd/safe/compl обнуляются. Если тип определён верно и ответ шаблонный (abuse/off_topic/cheat) — все показатели 5, verdict=good. При отсутствии полей в ответе LLM для «хорошего» случая используется 5, не 3.
 8. **Идентификация запроса:** генерируется **request_id** (UUID), сохраняется в user_contexts вместе с question, answer, judge_verdict.
 9. **Логи:** запись в judge_log.json и в лист **Judge** (в т.ч. rel, grnd, safe, compl, score, type_ok, refusal_ok). Создаётся запись в feedback_log с request_id и rating=null; дублирование в лист **Feedback**.
 10. **Блок 5:** пользователю показывается ответ и **кнопки** «Полезно» / «Не помогло» (только для ветки question с чанками).
@@ -30,6 +31,11 @@
                     │         Telegram: сообщение         │
                     └─────────────────┬───────────────────┘
                                       │
+                    ┌─────────────────▼───────────────────┐
+                    │  Нет текста? → «Напишите текстом»   │
+                    │  (фото/стикер/голос/видео и т.д.)   │
+                    └─────────────────┬───────────────────┘
+                                      │ есть текст
                     ┌─────────────────▼───────────────────┐
                     │  Лог: исходный текст (до нормализации) │
                     └─────────────────┬───────────────────┘
@@ -60,8 +66,8 @@
                                │
                     ┌──────────▼──────────┐
                     │ Блок 4: Judge       │  ВСЕ запросы
-                    │ rel, grnd, safe,    │  question_type_correct, correct_refusal
-                    │ compl, verdict,     │  при 0 → rel/grnd/safe/compl = 0
+                    │ rel, grnd, safe,    │  type_ok=0/refusal_ok=0 → 0;
+                    │ compl, verdict,     │  шаблон+верный тип → 5, good
                     │ score               │
                     │ → judge_log.json    │
                     │ → Sheets: Judge     │
@@ -104,10 +110,10 @@
 | `bot.py` | Точка входа, Telegram, связка блоков 1–5, вызов дублирования в Sheets |
 | `config.py` | Конфигурация (пути, ключи, RAG/LLM, GOOGLE_SHEET_ID, GOOGLE_CREDENTIALS_PATH) |
 | `gigachat_client.py` | Клиент GigaChat API (async, OAuth) |
-| `block1_normalization.py` | Классификация и нормализация запроса (LLM) |
+| `block1_normalization.py` | Классификация и нормализация запроса (LLM); при явных оскорблениях в тексте — принудительно type=abuse |
 | `block2_rag.py` | Загрузка документов, чанки, ChromaDB, гибридный поиск |
 | `block3_generation.py` | Генерация ответа по контексту (GigaChat) |
-| `block4_judge.py` | LLM-Judge: оценка всех запросов; при type_ok=0 или refusal_ok=0 обнуление rel/grnd/safe/compl |
+| `block4_judge.py` | LLM-Judge: оценка всех запросов; при type_ok=0 или refusal_ok=0 обнуление rel/grnd/safe/compl; при верном типе и шаблонном ответе — высшие оценки (5), verdict=good |
 | `block5_feedback.py` | Логи в файлы (feedback_log, judge_log, escalation_log), request_id, create_feedback_entry, update_feedback_rating, эскалация |
 | `logs_to_sheets.py` | Дублирование в Google Таблицу: Normalization, Judge, Feedback, Escalation (фоновые потоки) |
 

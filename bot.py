@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 user_contexts = {}
 
 
+NON_TEXT_REPLY = "Пожалуйста, напишите текстом. Я могу отвечать только на текстовые сообщения."
+
+
+async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """На фото, стикеры, голосовые и т.д. — просим писать текстом."""
+    await update.message.reply_text(NON_TEXT_REPLY)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user_id = update.effective_user.id
@@ -341,6 +349,8 @@ def main():
     application.add_handler(CommandHandler("my_id", my_id))
     application.add_handler(CommandHandler("reply", reply_to_student))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Любое сообщение без текста (фото, стикер, голос, видео и т.д.) — просим писать текстом
+    application.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_non_text))
     application.add_handler(CallbackQueryHandler(handle_feedback, pattern="^feedback_"))
     application.add_handler(CallbackQueryHandler(handle_escalation, pattern="^(escalate_|close_)"))
     
